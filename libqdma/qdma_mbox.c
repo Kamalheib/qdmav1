@@ -1,0 +1,616 @@
+/*
+ * This file is part of the Xilinx DMA IP Core driver for Linux
+ *
+ * Copyright (c) 2017-present,  Xilinx, Inc.
+ * All rights reserved.
+ *
+ * This source code is licensed under both the BSD-style license (found in the
+ * LICENSE file in the root directory of this source tree) and the GPLv2 (found
+ * in the COPYING file in the root directory of this source tree).
+ * You may select, at your option, one of the above-listed licenses.
+ */
+
+#define pr_fmt(fmt)	KBUILD_MODNAME ":%s: " fmt, __func__
+
+#include <linux/kernel.h>
+#include <linux/version.h>
+#include <linux/string.h>
+#include <linux/errno.h>
+#include <linux/jiffies.h>
+#include <linux/timer.h>
+#include <linux/delay.h>
+#include <linux/sched.h>
+
+#include "xdev.h"
+#include "qdma_device.h"
+#include "qdma_regs.h"
+#include "qdma_mbox.h"
+#include "qdma_context.h"
+
+#ifdef __QDMA_VF__
+static int mbox_proc_rcv(struct xlnx_dma_dev *xdev, int budget, int wait);
+#endif
+/*
+ * mailbox
+ */
+#ifndef __QDMA_VF__
+static inline void pf_mbox_clear_func_ack(struct xlnx_dma_dev *xdev, u8 func_id)
+{
+	int idx = func_id / 32; /* bitmask, u32 reg */ 
+	int bit = func_id % 32;
+
+	/* clear the function's ack status */
+	__write_reg(xdev,
+		MBOX_BASE + MBOX_PF_ACK_BASE + idx * MBOX_PF_ACK_STEP,
+		(1 << bit));
+}
+#endif
+
+static int mbox_send(struct xlnx_dma_dev *xdev, struct mbox_msg *m, int wait)
+{
+	struct mbox_msg_hdr *hdr = &m->hdr;
+	u32 fn_id = hdr->dst;
+	int i;
+	u32 reg = MBOX_OUT_MSG_BASE;
+	u32 v;
+	int rv;
+
+	hdr->sent = 0;
+
+	pr_debug("%s, dst 0x%x, op 0x%x, status reg 0x%x.\n",
+		xdev->conf.name, fn_id, m->hdr.op,
+		__read_reg(xdev, MBOX_BASE + MBOX_FN_STATUS));
+
+#ifndef __QDMA_VF__
+	__write_reg(xdev, MBOX_BASE + MBOX_FN_TARGET,
+			V_MBOX_FN_TARGET_ID(fn_id));
+#endif
+
+	if (wait) {
+		rv = hw_monitor_reg(xdev, MBOX_BASE + MBOX_FN_STATUS,
+			F_MBOX_FN_STATUS_OUT_MSG, 0, 100, 1000*1000); /* 1s */
+		if (rv < 0) {
+			pr_info("%s, func 0x%x, outgoing message busy, 0x%x.\n",
+				xdev->conf.name, fn_id,
+				__read_reg(xdev, MBOX_BASE + MBOX_FN_STATUS));
+			return -EAGAIN;
+		}
+	}
+
+	v = __read_reg(xdev, MBOX_BASE + MBOX_FN_STATUS);
+	if (v & F_MBOX_FN_STATUS_OUT_MSG) {
+		pr_info("%s, func 0x%x, outgoing message busy, 0x%x.\n",
+			xdev->conf.name, fn_id, v);
+		return -EAGAIN;
+	}
+
+	for (i = 0; i < MBOX_MSG_REG_MAX; i++, reg += MBOX_MSG_STEP)
+		__write_reg(xdev, MBOX_BASE + reg, m->raw[i]);
+
+	pr_debug("%s, send op 0x%x, src 0x%x, dst 0x%x, ack %d, w %d, s 0x%x:\n",
+		xdev->conf.name, m->hdr.op, m->hdr.src, m->hdr.dst, m->hdr.ack,
+		m->hdr.wait, m->hdr.status);
+#if 0
+	print_hex_dump(KERN_INFO, "mbox snd: ", DUMP_PREFIX_OFFSET,
+			16, 1, (void *)m, 64, false);
+#endif
+
+#ifndef __QDMA_VF__
+	/* clear the outgoing ack */
+	pf_mbox_clear_func_ack(xdev, fn_id);
+#endif
+
+	__write_reg(xdev, MBOX_BASE + MBOX_FN_CMD, F_MBOX_FN_CMD_SND);
+
+	hdr->sent = 1;
+
+	return 0;	
+}
+
+static int mbox_read(struct xlnx_dma_dev *xdev, struct mbox_msg *m, int wait)
+{
+	struct mbox_msg_hdr *hdr = &m->hdr;
+	u32 reg = MBOX_IN_MSG_BASE;
+	u32 v = 0;
+	int i;
+	int rv = 0;
+#ifndef __QDMA_VF__
+	unsigned int from_id = 0;
+#endif
+
+	hdr->rcv = 0;
+
+	if (wait) { 
+		rv = hw_monitor_reg(xdev, MBOX_BASE + MBOX_FN_STATUS,
+			F_MBOX_FN_STATUS_IN_MSG,
+			F_MBOX_FN_STATUS_IN_MSG,
+			1000, 1000 * 1000); /* 1s */
+		if (rv < 0)
+			return -EAGAIN;
+	}
+
+	v = __read_reg(xdev, MBOX_BASE + MBOX_FN_STATUS);
+
+#if 0
+	if ((v & MBOX_FN_STATUS_MASK))
+		pr_debug("%s, base 0x%x, status 0x%x.\n",
+			xdev->conf.name, MBOX_BASE, v);
+#endif
+
+	if (!(v & M_MBOX_FN_STATUS_IN_MSG))
+		return -EAGAIN;
+
+#ifndef __QDMA_VF__
+	from_id = G_MBOX_FN_STATUS_SRC(v);
+	__write_reg(xdev, MBOX_BASE + MBOX_FN_TARGET, from_id);
+#endif
+
+	for (i = 0; i < MBOX_MSG_REG_MAX; i++, reg += MBOX_MSG_STEP)
+		m->raw[i] = __read_reg(xdev, MBOX_BASE + reg);
+
+	pr_debug("%s, rcv op 0x%x, src 0x%x, dst 0x%x, ack %d, w %d, s 0x%x:\n",
+		xdev->conf.name, m->hdr.op, m->hdr.src, m->hdr.dst,
+		m->hdr.ack, m->hdr.wait, m->hdr.status);
+#if 0
+	print_hex_dump(KERN_INFO, "mbox rcv: ", DUMP_PREFIX_OFFSET,
+			16, 1, (void *)m, 64, false);
+#endif
+
+#ifndef __QDMA_VF__
+	if (from_id != m->hdr.src) {
+		pr_debug("%s, src 0x%x -> func_id 0x%x.\n",
+			xdev->conf.name, m->hdr.src, from_id);
+		m->hdr.src = from_id;
+	}
+#endif
+
+	/* ack'ed the sender */
+	__write_reg(xdev, MBOX_BASE + MBOX_FN_CMD, F_MBOX_FN_CMD_RCV);
+
+	return 0;
+}
+
+int qdma_mbox_send_msg(struct xlnx_dma_dev *xdev, struct mbox_msg *m,
+			bool wait_resp)
+{
+	int rv = 0;
+	struct mbox_msg_hdr *hdr = &m->hdr;
+
+	if (wait_resp) {
+		hdr->ack = 0;
+		hdr->wait = 1;
+	} else
+		hdr->wait = 0;
+
+	spin_lock_bh(&xdev->mbox_lock);
+	rv = mbox_send(xdev, m, 1);
+	if (rv < 0) {
+		pr_info("%s, send failed %d.\n", xdev->conf.name, rv);
+		goto unlock;
+	}
+
+	if (wait_resp) {
+		memset(&xdev->m_req, 0, sizeof(struct mbox_msg));
+ 		hdr = &xdev->m_req.hdr;
+
+#ifdef __QDMA_VF__
+		/* 1 sec. max */
+		rv = mbox_proc_rcv(xdev, 1, 1);
+		if (rv <= 0) 
+			goto unlock;
+
+		if ((hdr->op == m->hdr.op) && (hdr->ack)) {
+			rv = hdr->status;
+		} else {
+			print_hex_dump(KERN_INFO, "sent ", DUMP_PREFIX_OFFSET,
+				16, 1, (void *)m, 64, false);
+			print_hex_dump(KERN_INFO, "rcv ", DUMP_PREFIX_OFFSET,
+				16, 1, (void *)hdr, 64, false);
+			rv = -ETIME;
+		}
+#else
+		spin_unlock_bh(&xdev->mbox_lock);
+
+		rv = wait_event_interruptible_timeout(xdev->mbox_wq, hdr->ack,
+				msecs_to_jiffies(5000));
+
+		spin_lock_bh(&xdev->mbox_lock);
+		if ((hdr->op == m->hdr.op) && (hdr->ack)) {
+			rv = hdr->status;
+			memcpy(m, hdr, sizeof(struct mbox_msg));
+		} else {
+			print_hex_dump(KERN_INFO, "sent", DUMP_PREFIX_OFFSET,
+				16, 1, (void *)m, 64, false);
+			print_hex_dump(KERN_INFO, "rcv", DUMP_PREFIX_OFFSET,
+				16, 1, (void *)hdr, 64, false);
+			rv = -ETIME;
+		}
+#endif
+	}
+
+unlock:
+	spin_unlock_bh(&xdev->mbox_lock);
+	return rv;
+}
+
+#ifdef __QDMA_VF__
+
+static int mbox_proc_rcv(struct xlnx_dma_dev *xdev, int budget, int wait)
+{
+	struct mbox_msg *m = &xdev->m_resp;
+	struct mbox_msg_hdr *hdr = &m->hdr;
+	char status = MBOX_STATUS_GOOD;
+	int cnt = 0;
+	int rv = 0;
+
+	while (mbox_read(xdev, m, wait) == 0) {
+		cnt++;
+
+		if (hdr->ack) {
+			pr_debug("%s, func 0x%x ACK'ed op 0x%x, s 0x%x, w %d.\n",
+				xdev->conf.name, hdr->src, hdr->op,
+				hdr->status, hdr->wait);
+
+			if (!xdev->func_id) {
+				/* fill in VF's func_id */
+				xdev->func_id = hdr->dst;
+				xdev->func_id_parent = hdr->src;
+			}
+
+			if (hdr->wait)
+				memcpy(&xdev->m_req, m,
+					sizeof(struct mbox_msg));
+
+			if (budget && cnt >= budget)
+				break;
+			else
+				continue;
+		}
+
+		switch (hdr->op) {
+		case MBOX_OP_RESET:
+		{
+			pr_info("%s, rcv 0x%x RESET, NOT supported.\n",
+				xdev->conf.name, hdr->src);
+		}
+		break;
+		default:
+			pr_info("%s: rcv mbox UNKNOWN op 0x%x.\n",
+				xdev->conf.name, hdr->op);
+			print_hex_dump(KERN_INFO, "mbox rcv: ",
+					DUMP_PREFIX_OFFSET, 16, 1, (void *)hdr,
+					64, false);
+			status = -MBOX_STATUS_EINVAL;
+		break;
+		}
+
+		if (hdr->wait) {
+			/* respond */
+			hdr->dst = hdr->src;
+			hdr->src = xdev->func_id;
+
+			hdr->ack = 1;
+			hdr->status = status;
+
+			rv = mbox_send(xdev, m, 1);
+			if (rv < 0) {
+				pr_warn("%s resp failed, dst 0x%x, op 0x%x",
+					xdev->conf.name, hdr->dst, hdr->op);
+				break;
+			}
+		}
+
+		if ((xlnx_dma_device_flag_check(xdev, XDEV_FLAG_OFFLINE)))
+			break;
+
+		if (budget && cnt >= budget)
+			break;
+	}
+
+	return rv < 0 ? rv : cnt;
+}
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,15,0)
+static void qdma_mbox_proc(struct timer_list *t)
+#else
+static void qdma_mbox_proc(unsigned long arg)
+#endif
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,15,0)
+	struct xlnx_dma_dev *xdev = from_timer(xdev, t, mbox_timer);
+#else
+	struct xlnx_dma_dev *xdev = (struct xlnx_dma_dev *)arg;
+#endif
+	struct pci_dev *pdev = xdev ? xdev->conf.pdev : NULL;
+
+	if (!xdev || !pdev) {
+		pr_info("xdev 0x%p, pdev 0x%p.\n", xdev, pdev);
+		return;
+	}
+
+	spin_lock_bh(&xdev->mbox_lock);
+	mbox_proc_rcv(xdev, 0, 0);
+	spin_unlock_bh(&xdev->mbox_lock);
+
+	if (xlnx_dma_device_flag_check(xdev, XDEV_FLAG_OFFLINE)) {
+		qdma_mbox_timer_stop(xdev);
+	} else {
+		qdma_mbox_timer_start(xdev);
+	}
+}
+
+#else
+
+/*
+ * mbox PF
+ */
+
+static void pf_mbox_clear_ack(struct xlnx_dma_dev *xdev)
+{
+	u32 v = __read_reg(xdev, MBOX_BASE + MBOX_FN_STATUS);
+	u32 reg = MBOX_BASE + MBOX_PF_ACK_BASE;
+	int i;
+
+	if ((v & F_MBOX_FN_STATUS_ACK) == 0)
+		return;
+
+	for (i = 0; i < MBOX_PF_ACK_COUNT; i++, reg += MBOX_PF_ACK_STEP) {
+		u32 v = __read_reg(xdev, reg);
+
+		if (!v)
+			continue;
+
+		/* clear the ack status */
+		pr_debug("%s, PF_ACK %d, 0x%x.\n", xdev->conf.name, i, v);
+		__write_reg(xdev, reg, v);
+	}
+}
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,15,0)
+static void qdma_mbox_proc(struct timer_list *t)
+#else
+static void qdma_mbox_proc(unsigned long arg)
+#endif
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,15,0)
+	struct xlnx_dma_dev *xdev = from_timer(xdev, t, mbox_timer);
+#else
+	struct xlnx_dma_dev *xdev = (struct xlnx_dma_dev *)arg;
+#endif
+	struct pci_dev *pdev = xdev ? xdev->conf.pdev : NULL;
+	struct mbox_msg m;
+	struct mbox_msg_hdr *hdr = &m.hdr;
+	char status = MBOX_STATUS_GOOD;
+	int rv;
+
+	if (!xdev || !pdev) {
+		pr_info("xdev 0x%p, pdev 0x%p.\n", xdev, pdev);
+		return;
+	}
+
+	spin_lock_bh(&xdev->mbox_lock);
+
+	/* clear the ack status */
+	pf_mbox_clear_ack(xdev);
+
+	while (mbox_read(xdev, &m, 0) == 0) {
+
+		if (hdr->ack) {
+			pr_debug("%s, rcv 0x%x ACK'ed op 0x%x, w %d, s 0x%x.\n",
+				xdev->conf.name, hdr->src, hdr->op, hdr->wait,
+				hdr->status);
+			continue;
+		}
+
+		pr_debug("%s, rcv 0x%x op 0x%x, w %d, s 0x%x.\n",
+			xdev->conf.name, hdr->src, hdr->op, hdr->wait,
+			hdr->status);
+
+		rv = 0;
+		switch (hdr->op) {
+		case MBOX_OP_HELLO:
+		{
+			pr_debug("%s: rcv 0x%x HELLO.\n",
+				xdev->conf.name, hdr->src);
+			xdev_sriov_vf_online(xdev, hdr->src);
+		}
+		break;
+		case MBOX_OP_BYE:
+		{
+			pr_debug("%s, rcv 0x%x BYE.\n",
+				xdev->conf.name, hdr->src);
+
+			hw_set_fmap(xdev, hdr->src, 0, 0);
+			xdev_sriov_vf_offline(xdev, hdr->src);
+		}
+		break;
+		case MBOX_OP_FMAP:
+		{
+			struct mbox_msg_fmap *fmap = &m.fmap;
+
+			if (!fmap->qbase)
+				fmap->qbase = xdev->conf.qsets_base +
+					xdev->conf.qsets_max +
+					(hdr->src - QDMA_PF_MAX) *
+						QDMA_Q_PER_VF_MAX;
+
+			pr_debug("%s: set 0x%x FMAP, Q 0x%x+0x%x.\n",
+				xdev->conf.name, hdr->src, fmap->qbase,
+				fmap->qmax);
+
+			hw_set_fmap(xdev, hdr->src, fmap->qbase, fmap->qmax);
+
+			xdev_sriov_vf_fmap(xdev, hdr->src, fmap->qbase,
+						fmap->qmax);
+		}
+		break;
+		case MBOX_OP_CSR:
+		{
+			struct mbox_msg_csr *csr = &m.csr;
+			enum mbox_csr_type type = csr->type;
+
+			pr_debug("%s: rcv vf 0x%x CSR, type 0x%x.\n",
+				xdev->conf.name, hdr->src, type);
+
+			switch (type) {
+			case CSR_RNGSZ:
+				qdma_csr_read_rngsz(xdev, csr->v);
+				qdma_csr_read_wbacc(xdev, &csr->wb_acc);
+				break;
+			case CSR_BUFSZ:
+				qdma_csr_read_bufsz(xdev, csr->v);
+				qdma_csr_read_wbacc(xdev, &csr->wb_acc);
+				break;
+			case CSR_TIMER_CNT:
+				qdma_csr_read_timer_cnt(xdev, csr->v);
+				qdma_csr_read_wbacc(xdev, &csr->wb_acc);
+				break;
+			case CSR_CNT_TH:
+				qdma_csr_read_cnt_thresh(xdev, csr->v);
+				qdma_csr_read_wbacc(xdev, &csr->wb_acc);
+				break;
+			default:
+				pr_info("%s: vf %d, CSR, bad type 0x%x.\n",
+					xdev->conf.name, hdr->src, type);
+				status = -EINVAL;
+				break;
+			}
+		}
+		break;
+		case MBOX_OP_INTR_CTXT:
+		{
+			pr_info("%s, rcv 0x%x INTR_CTXT, NOT supported.\n",
+				xdev->conf.name, hdr->src);
+
+			rv = -EINVAL;
+		}
+		break;
+		case MBOX_OP_QCTXT_CLR:
+		{
+			struct mbox_msg_qctxt *qctxt = &m.qctxt;
+
+			pr_debug("%s, rcv 0x%x QCTXT_CLR, qid 0x%x.\n",
+				xdev->conf.name, hdr->src, qctxt->qid);
+
+			 rv = qdma_descq_context_clear(xdev, qctxt->qid,
+						qctxt->st, qctxt->c2h, 0);
+		}
+		break;
+		case MBOX_OP_QCTXT_RD:
+		{
+			struct mbox_msg_qctxt *qctxt = &m.qctxt;
+
+			pr_debug("%s, rcv 0x%x QCTXT_RD, qid 0x%x.\n",
+				xdev->conf.name, hdr->src, qctxt->qid);
+
+			rv = qdma_descq_context_read(xdev, qctxt->qid,
+						qctxt->st, qctxt->c2h,
+						&qctxt->context);
+		}
+		break;
+		case MBOX_OP_QCTXT_WRT:
+		{
+			struct mbox_msg_qctxt *qctxt = &m.qctxt;
+
+			pr_debug("%s, rcv 0x%x QCTXT_WRT, qid 0x%x.\n",
+				xdev->conf.name, hdr->src, qctxt->qid);
+
+			/* always clear the context first */
+			rv = qdma_descq_context_clear(xdev, qctxt->qid,
+						qctxt->st, qctxt->c2h, 1);
+			if (rv < 0) {
+				pr_info("%s, 0x%x QCTXT_WRT, qid 0x%x, "
+					"clr failed %d.\n",
+					xdev->conf.name, hdr->src, qctxt->qid,
+					rv);
+				break;
+			}
+				
+			rv = qdma_descq_context_program(xdev, qctxt->qid,
+						qctxt->st, qctxt->c2h,
+						&qctxt->context);
+		}
+		break;
+		default:
+			pr_info("%s: rcv mbox UNKNOWN op 0x%x.\n",
+				xdev->conf.name, hdr->op);
+			print_hex_dump(KERN_INFO, "mbox rcv: ",
+					DUMP_PREFIX_OFFSET, 16, 1, (void *)hdr,
+					64, false);
+			status = -MBOX_STATUS_EINVAL;
+		break;
+		}
+
+		if (hdr->wait) {
+			if (rv < 0 && !status)
+				status = -MBOX_STATUS_ERR;
+
+			/* respond */
+			hdr->dst = hdr->src;
+			hdr->src = xdev->func_id;
+
+			hdr->ack = 1;
+			hdr->status = status;
+
+			rv = mbox_send(xdev, &m, 1);
+			if (rv < 0) {
+				pr_warn("%s resp failed, dst 0x%x, op 0x%x",
+					xdev->conf.name, hdr->dst, hdr->op);
+				break;
+			}
+		}
+
+		if ((xlnx_dma_device_flag_check(xdev, XDEV_FLAG_OFFLINE)))
+			break;
+	}
+
+	spin_unlock_bh(&xdev->mbox_lock);
+
+	if (xlnx_dma_device_flag_check(xdev, XDEV_FLAG_OFFLINE))
+		qdma_mbox_timer_stop(xdev);
+	else
+		qdma_mbox_timer_start(xdev);
+}
+#endif
+
+void qdma_mbox_timer_init(struct xlnx_dma_dev *xdev)
+{
+	struct timer_list *timer = &xdev->mbox_timer;
+
+	/* ack any received messages in the Q */
+#ifdef __QDMA_VF__
+	u32 v;
+	v = __read_reg(xdev, MBOX_BASE + MBOX_FN_STATUS);
+	if (!(v & M_MBOX_FN_STATUS_IN_MSG))
+		__write_reg(xdev, MBOX_BASE + MBOX_FN_CMD, F_MBOX_FN_CMD_RCV);
+#elif defined(CONFIG_PCI_IOV)
+	pf_mbox_clear_ack(xdev);
+#endif
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,15,0)
+	timer_setup(timer, qdma_mbox_proc, 0);
+#else
+	init_timer(timer);
+	timer->data = (unsigned long)xdev;
+	del_timer(timer);
+#endif
+}
+
+void qdma_mbox_timer_start(struct xlnx_dma_dev *xdev)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,15,0)
+	mod_timer(&xdev->mbox_timer, round_jiffies(jiffies + HZ/10));
+#else
+	struct timer_list *timer = &xdev->mbox_timer;
+
+	del_timer(timer);
+	timer->function = qdma_mbox_proc;
+	timer->expires = HZ/20 + jiffies;	/* 50ms */
+	add_timer(timer);
+#endif
+}
+
+void qdma_mbox_timer_stop(struct xlnx_dma_dev *xdev)
+{
+	del_timer(&xdev->mbox_timer);
+}

@@ -1,0 +1,29 @@
+Release: 2018.2.preliminary
+===========================
+
+NOTE:
+	This is a preliminary release, which means the driver is mostly feature
+	complete but still going through vigorous testing currently and likely
+	to contain a bugs.
+
+	This version of driver is NOT suitable for performance benchmark.
+
+	*An update release with complete feature testing is scheduled in the 2nd
+	week of July, 2018.
+
+
+DRIVER LIMITATIONS:
+===================
+- Up to 512 Queues can be enabled per PF
+- Up to 8 Queues can be enabled per VF
+- Interrupt is not enabled
+
+
+KNOWN BUGS:
+===========
+
+- When descriptor bypass mode is enabled, interrupts are missing due to race condition and transfer fails  [ XDMA-229]
+- When both descriptor bypass and descriptor prefetch are enabled, ST H2c to C2H loopback does not work [XDMA-269]
+- When write back entry size is set to 32bytes, Immediate Data and payload data mix not working [XDMA-278]
+- Open and close queues multiple time could cause system crash. [PB-36]
+
